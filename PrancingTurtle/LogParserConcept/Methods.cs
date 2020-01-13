@@ -3,10 +3,15 @@ using LogParserConcept.Models;
 using System;
 using System.Linq;
 using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using LogParserConcept.Models.ParsedStats;
+using Newtonsoft.Json;
 
 namespace LogParserConcept
 {
@@ -38,7 +43,11 @@ namespace LogParserConcept
             new DowntimeOverride{NpcName = "Denizar", DowntimeSeconds = 30}
         };
 
-        private const int DefaultEncounterDowntime = 15; // 15 seconds
+        /// <summary>
+        /// The default period of time in seconds after the last
+        /// damage event before declaring an encounter ended
+        /// </summary>
+        private const int DefaultEncounterDowntime = 15;
 
         public static async Task ParseAsync(SessionLogInfo logInfo, string logFile)
         {
@@ -56,9 +65,13 @@ namespace LogParserConcept
             Console.WriteLine($"Beginning to parse {logFile}");
             await using var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 4096, true);
             using var sr = new StreamReader(fs);
-            // TODO: Stop being lazy while testing and check for the actual timezone.
-            // TODO: Stop being lazy while testing and check for the log type instead of assuming that we're logging with Standard.
-            var logType = LogType.Standard;
+            #region Calculate when the session starts in local and UTC time
+            // Session date is stored in UTC already, so instead of subtracting offset for UTC, add offset for local
+            TimeZoneInfo tzi = TimeZoneInfo.FindSystemTimeZoneById(logInfo.UploaderTimezone);
+            DateTime localSessionDate = logInfo.SessionDate.Add(tzi.GetUtcOffset(logInfo.SessionDate));
+            Console.WriteLine($"Session date (local time): {localSessionDate}, UTC time: {logInfo.SessionDate}");
+            #endregion
+            var logType = LogType.Unknown;
 
             // Main loop
             var line = "";
@@ -71,19 +84,66 @@ namespace LogParserConcept
             double daysToAdd = 0;
             var lastTimeStamp = new DateTime();
             //var calculatedTimestamp = new DateTime();
-            var encounterLength = new TimeSpan(0,0,0,0);
+            var encounterLength = new TimeSpan(0, 0, 0, 0);
+            var unwrittenLines = new List<string>();
 
+            // Per encounter counters
+            long totalDamage = 0;
+            long totalHealing = 0;
+            long totalShielding = 0;
+            int damageEvents = 0;
+            int healingEvents = 0;
+            int shieldingEvents = 0;
+            int buffEvents = 0;
+            Dictionary<string, int> playerDeaths = new Dictionary<string, int>();
+            Dictionary<string, int> npcDeaths = new Dictionary<string, int>();
+            Dictionary<string, long> npcDamageTaken = new Dictionary<string, long>();
+
+            // Globals
             var players = new HashSet<string>();
             var npcs = new HashSet<string>();
             var pets = new HashSet<string>();
             var abilities = new HashSet<string>();
+            Dictionary<string, int> globalPlayerDeaths = new Dictionary<string, int>();
+            Dictionary<string, int> globalNpcDeaths = new Dictionary<string, int>();
+            Dictionary<string, long> globalNpcDamageTaken = new Dictionary<string, long>();
+            long globalTotalDamage = 0;
+            long globalTotalHealing = 0;
+            long globalTotalShielding = 0;
+            int globalDamageEvents = 0;
+            int globalHealingEvents = 0;
+            int globalShieldingEvents = 0;
+            int globalBuffEvents = 0;
+            var totalEncounterDuration = new TimeSpan();
 
             // Testing
             Stopwatch encWriter = new Stopwatch();
 
             while ((line = sr.ReadLine()) != null)
             {
-                var entry = await ParseLine(line);
+                // If we don't know what type of log this is yet, then figure that out now
+                if (logType == LogType.Unknown)
+                {
+                    if (line.Length > 8)
+                    {
+                        if (line.Substring(2, 1) == ":" && line.Substring(5, 1) == ":")
+                        {
+                            logType = LogType.Standard;
+                        }
+                        else if (line.Substring(2, 1) == "/" && line.Substring(5, 1) == "/")
+                        {
+                            logType = LogType.Expanded;
+                        }
+                    }
+
+                    // If we haven't figured out the log type by this point, skip processing this line and check the next one
+                    if (logType == LogType.Unknown)
+                    {
+                        continue;
+                    }
+                }
+
+                var entry = await ParseLine(line, logType);
                 if (entry.ValidEntry == false)
                 {
                     if (!line.Contains("Combat Begin") && !line.Contains("Combat End"))
@@ -92,7 +152,8 @@ namespace LogParserConcept
                         Console.WriteLine(line);
                         Console.WriteLine();
                     }
-                    // Skip the rest of this loop
+                    // Skip the rest of this loop, but increment the line number before we do
+                    lineNumber++;
                     continue;
                 }
 
@@ -106,7 +167,7 @@ namespace LogParserConcept
 
                         // Begin combat.
                         encounterNumber++;
-                        encounterLength = new TimeSpan(0,0,0,0);
+                        encounterLength = new TimeSpan(0, 0, 0, 0);
                         Console.WriteLine($"Encounter {encounterNumber} started at {entry.ParsedTimeStamp.AddDays(daysToAdd)}");
                         // Default the encounter time unless it needs to be overridden
                         downtimeSeconds = entry.GetDowntimeValueForEncounter();
@@ -115,6 +176,7 @@ namespace LogParserConcept
                             Console.WriteLine($"Detected an overridden encounter downtime. The value is now {downtimeSeconds}");
                         }
                         inCombat = true;
+                        unwrittenLines = new List<string>();
 
                         // Set the variables that we'll use to determine when the encounter should end
                         currentCombatStarted = entry.ParsedTimeStamp.AddDays(daysToAdd);
@@ -122,7 +184,7 @@ namespace LogParserConcept
                         currentCombatLastDamage = entry.ParsedTimeStamp.AddDays(daysToAdd);
 
                         // Update the time elapsed for this event
-                        entry.SetTimeElapsed(currentCombatStarted);
+                        entry.SetTimeElapsed(currentCombatStarted, true);
 
                         // Create the files that we'll use for this encounter
                         var encounterContainersCreated = CreateEncounterContainers(sessionPath, encounterNumber);
@@ -131,13 +193,29 @@ namespace LogParserConcept
                             Console.WriteLine($"Unable to create containers for encounter {encounterNumber}.");
                         }
 
+                        // Reset counters
+                        totalDamage = 0;
+                        totalHealing = 0;
+                        totalShielding = 0;
+                        damageEvents = 0;
+                        healingEvents = 0;
+                        shieldingEvents = 0;
+                        buffEvents = 0;
+                        playerDeaths = new Dictionary<string, int>();
+                        npcDeaths = new Dictionary<string, int>();
+                        npcDamageTaken = new Dictionary<string, long>();
+
                         #region Single line append
                         encWriter.Reset();
                         encWriter.Start();
                         // NB: This is only used to append lines one at a time.
                         // Add this entry to the file that it belongs to
                         await AppendLine(sessionPath, encounterNumber, encounterContainers[entry.ContainerType], line);
+                        // Testing: Write to the encounter file
+                        await AppendLine_SingleFileForEncounter(sessionPath, encounterNumber, line);
+
                         //Console.WriteLine($"{entry.SecondsElapsed}: {line}");
+
                         #endregion
                     }
                 }
@@ -166,6 +244,8 @@ namespace LogParserConcept
                         encWriter.Stop();
                         inCombat = false;
                         encounterLength = currentCombatLastDamage - currentCombatStarted;
+                        // Update global encounter totals
+                        totalEncounterDuration += encounterLength;
                         Console.WriteLine($"Combat for encounter {encounterNumber} ended at {entry.ParsedTimeStamp.AddDays(daysToAdd)} ({entry.SecondsElapsed} seconds elapsed). Time elapsed for reading and writing: {encWriter.Elapsed}");
                         Console.WriteLine($"The last damage was detected at {currentCombatLastDamage}");
                         var encInfo = new List<string>
@@ -173,9 +253,28 @@ namespace LogParserConcept
                             $"Encounter {encounterNumber}",
                             $"Started: {currentCombatStarted}",
                             $"Ended: {currentCombatLastDamage}",
-                            $"Duration: {encounterLength}"
+                            $"Duration: {encounterLength}",
+                            "===================",
+                            $"Total damage done: {totalDamage}. Events: {damageEvents}",
+                            $"Total healing done: {totalHealing}. Events: {healingEvents}",
+                            $"Total shielding done: {totalShielding}. Events: {shieldingEvents}",
+                            "-------------------",
+                            $"Deaths: {playerDeaths.Sum(kvp => kvp.Value) + npcDeaths.Sum(kvp => kvp.Value)}",
+                            "-------------------",
                         };
-                        await WriteEncounterInfo(sessionPath, encounterNumber, encInfo);
+
+                        encInfo.AddRange(playerDeaths.OrderByDescending(kvp => kvp.Value).Select(death => $"{death.Key}: {death.Value}"));
+                        encInfo.Add("-------------------");
+                        encInfo.AddRange(npcDeaths.OrderByDescending(kvp => kvp.Value).Select(death => $"{death.Key}: {death.Value}"));
+
+                        var encStats = new EncounterStats(
+                            encounterNumber, encounterLength, totalDamage, damageEvents, totalHealing, healingEvents,
+                            totalShielding, shieldingEvents, playerDeaths, npcDeaths, npcDamageTaken);
+
+                        // Old pre-JSON encounter stats
+                        //await WriteEncounterInfo(sessionPath, encounterNumber, encInfo);
+                        // JSON
+                        //await WriteEncounterStats(sessionPath, encounterNumber, encStats);
 
                         // Remove the encounter folder if it's not long enough to warrant saving
                         encounterLength = currentCombatLastDamage - currentCombatStarted;
@@ -188,6 +287,32 @@ namespace LogParserConcept
                                 Console.WriteLine($"Encounter {encounterNumber} removed (<5s)");
                             }
                         }
+
+                        // Update the session text file
+                        var globalInfo = new List<string>
+                        {
+                            $"Total encounters: {encounterNumber}",
+                            $"Total encounter time: <Not calculated>",
+                            "===================",
+                            $"Total damage done: {globalTotalDamage}. Events: {globalDamageEvents}",
+                            $"Total healing done: {globalTotalHealing}. Events: {globalHealingEvents}",
+                            $"Total shielding done: {globalTotalShielding}. Events: {globalShieldingEvents}",
+                            "-------------------",
+                            $"Deaths: {globalPlayerDeaths.Sum(kvp => kvp.Value) + globalNpcDeaths.Sum(kvp => kvp.Value)}",
+                            "-------------------",
+                        };
+
+                        globalInfo.AddRange(globalPlayerDeaths.OrderByDescending(kvp => kvp.Value).Select(death => $"{death.Key}: {death.Value}"));
+                        globalInfo.Add("-------------------");
+                        globalInfo.AddRange(globalNpcDeaths.OrderByDescending(kvp => kvp.Value).Select(death => $"{death.Key}: {death.Value}"));
+
+                        // Old pre-JSON encounter stats
+                        //await WriteSessionInfo(sessionPath, globalInfo);
+                        // JSON
+                        //await WriteSessionStats(sessionPath, new SessionStats
+                        //(encounterNumber, totalEncounterDuration, globalTotalDamage, globalDamageEvents,
+                        //    globalTotalHealing, globalHealingEvents, globalTotalShielding, globalShieldingEvents,
+                        //    globalPlayerDeaths, globalNpcDeaths, globalNpcDamageTaken));
                     }
                     // Still in combat but not outside our downtime period. Write the event if we need to
                     else if (!entry.IgnoreThisEvent)
@@ -201,52 +326,149 @@ namespace LogParserConcept
                             }
                         }
 
+                        // Write damage/death records immediately, but collect all other logged entries and write them if we find another damage
+                        // record within the permitted downtime. If nothing happens for X seconds, then discard unwritten lines.
                         switch (entry.ContainerType)
                         {
-                            case EncounterContainerType.Unknown:
-                                Console.WriteLine($"  Unknown container type. Line: {line}");
+                            case EncounterContainerType.Damage:
+                            case EncounterContainerType.Death:
+                                // Write any previously unwritten lines to the log
+                                if (unwrittenLines.Any())
+                                {
+                                    await AppendLine_SingleFileForEncounter(sessionPath, encounterNumber, unwrittenLines);
+                                    unwrittenLines = new List<string>();
+                                }
+                                await AppendLine_SingleFileForEncounter(sessionPath, encounterNumber, line);
                                 break;
                             case EncounterContainerType.NotLogged:
+                            case EncounterContainerType.Unknown:
+                                // Do nothing with these
                                 break;
                             default:
-                                //Console.WriteLine($"{entry.SecondsElapsed}: {line}");
-                                await AppendLine(sessionPath, encounterNumber, encounterContainers[entry.ContainerType], line);
-                                switch (entry.AttackerType)
-                                {
-                                    case CharacterType.Player:
-                                        players.Add(entry.AttackerName);
-                                        break;
-                                    case CharacterType.Npc:
-                                        npcs.Add(entry.AttackerName);
-                                        break;
-                                    case CharacterType.Pet:
-                                        pets.Add(entry.AttackerName);
-                                        break;
-                                }
-                                switch (entry.TargetType)
-                                {
-                                    case CharacterType.Player:
-                                        players.Add(entry.TargetName);
-                                        break;
-                                    case CharacterType.Npc:
-                                        npcs.Add(entry.TargetName);
-                                        break;
-                                    case CharacterType.Pet:
-                                        pets.Add(entry.TargetName);
-                                        break;
-                                }
-
-                                abilities.Add(entry.AbilityName);
+                                // Not a death or damage record so add this to the list of unwritten lines
+                                unwrittenLines.Add(line);
                                 break;
                         }
+
+                        // This switch works well, but still logs entries after it needs to (when combat is finished)
+                        //switch (entry.ContainerType)
+                        //{
+                        //    case EncounterContainerType.Unknown:
+                        //        Console.WriteLine($"  Unknown container type. Line: {line}");
+                        //        break;
+                        //    case EncounterContainerType.NotLogged:
+                        //        break;
+                        //    default:
+                        //        //Console.WriteLine($"{entry.SecondsElapsed}: {line}");
+                        //        await AppendLine(sessionPath, encounterNumber, encounterContainers[entry.ContainerType], line);
+                        //        await AppendLine_SingleFileForEncounter(sessionPath, encounterNumber, line);
+                        //        switch (entry.AttackerType)
+                        //        {
+                        //            case CharacterType.Player:
+                        //                players.Add(entry.AttackerName);
+                        //                break;
+                        //            case CharacterType.Npc:
+                        //                npcs.Add(entry.AttackerName);
+                        //                break;
+                        //            case CharacterType.Pet:
+                        //                pets.Add(entry.AttackerName);
+                        //                break;
+                        //        }
+                        //        switch (entry.TargetType)
+                        //        {
+                        //            case CharacterType.Player:
+                        //                players.Add(entry.TargetName);
+                        //                break;
+                        //            case CharacterType.Npc:
+                        //                npcs.Add(entry.TargetName);
+                        //                break;
+                        //            case CharacterType.Pet:
+                        //                pets.Add(entry.TargetName);
+                        //                break;
+                        //        }
+
+                        //        abilities.Add(entry.AbilityName);
+                        //        break;
+                        //}
+
+                        // Testing / encounter stats
+
+                        //// Switch the container type again to add to the correct counter
+                        //switch (entry.ContainerType)
+                        //{
+                        //    case EncounterContainerType.Buff:
+                        //        buffEvents += 1;
+                        //        globalBuffEvents += 1;
+                        //        break;
+                        //    case EncounterContainerType.Damage:
+                        //        damageEvents += 1;
+                        //        totalDamage += entry.TotalDamage;
+                        //        globalDamageEvents += 1;
+                        //        globalTotalDamage += entry.TotalDamage;
+                        //        if (entry.TargetType == CharacterType.Npc && entry.TargetTakingDamage)
+                        //        {
+                        //            npcDamageTaken.AddDamageTaken(entry.TargetName, entry.ActionValue);
+                        //            globalNpcDamageTaken.AddDamageTaken(entry.TargetName, entry.ActionValue);
+                        //        }
+                        //        break;
+                        //    case EncounterContainerType.Heal:
+                        //        healingEvents += 1;
+                        //        totalHealing += entry.ActionValue;
+                        //        globalHealingEvents += 1;
+                        //        globalTotalHealing += entry.ActionValue;
+                        //        break;
+                        //    case EncounterContainerType.Shield:
+                        //        shieldingEvents += 1;
+                        //        totalShielding += entry.ActionValue;
+                        //        globalShieldingEvents += 1;
+                        //        globalTotalShielding += entry.ActionValue;
+                        //        break;
+                        //    case EncounterContainerType.Death:
+                        //        switch (entry.TargetType)
+                        //        {
+                        //            case CharacterType.Player:
+                        //                playerDeaths.AddDeath(entry.TargetName);
+                        //                globalPlayerDeaths.AddDeath(entry.TargetName);
+                        //                break;
+                        //            case CharacterType.Npc:
+                        //                npcDeaths.AddDeath(entry.TargetName);
+                        //                globalNpcDeaths.AddDeath(entry.TargetName);
+                        //                break;
+                        //        }
+                        //        break;
+                        //}
                     }
                 }
-
+                
                 lineNumber++;
             }
         }
 
-        public static async Task<LogEntry> ParseLine(string logLine)
+        private static void AddDamageTaken(this Dictionary<string, long> dict, string name, long value)
+        {
+            if (dict.ContainsKey(name))
+            {
+                dict[name] = dict[name] + value;
+            }
+            else
+            {
+                dict.Add(name, value);
+            }
+        }
+
+        private static void AddDeath(this Dictionary<string, int> dict, string name)
+        {
+            if (dict.ContainsKey(name))
+            {
+                dict[name] = dict[name] + 1;
+            }
+            else
+            {
+                dict.Add(name, 1);
+            }
+        }
+
+        public static async Task<LogEntry> ParseLine(string logLine, LogType logType)
         {
             var entry = new LogEntry();
 
@@ -265,9 +487,43 @@ namespace LogParserConcept
                 entry.InvalidReason = "Bracket counts are not equal";
                 return entry;
             }
-
+            
             // Date parsing
-            if (!DateTime.TryParse(logLine.Substring(0, 8), out var entryDate))
+            // Standard logs have a 9 character date (actually, no date but let's ignore that fact)
+            // Expanded logs are in the format mm/dd/yyyy hh:mm:ss:mms: (assume mms means milliseconds)
+            var dateLength = logType == LogType.Standard ? 9 : 24;
+
+            var entryDate = new DateTime();
+            if (logType == LogType.Expanded)
+            {
+                // When /combatlogexpanded was added, the millisecond value wasn't forced to 3 digits.
+                // It is now, but we have to handle a 2 digit ms value if we want to be able to use old logs.
+                
+                // 12/02/2016 08:19:51:798:
+                // 12/02/2016 08:19:52:02:
+                // 12/02/2016 08:21:35:00:
+                var month = int.Parse(logLine.Substring(0, 2));
+                var day = int.Parse(logLine.Substring(3, 2));
+                var year = int.Parse(logLine.Substring(6, 4));
+                var hour = int.Parse(logLine.Substring(11, 2));
+                var minute = int.Parse(logLine.Substring(14, 2));
+                var second = int.Parse(logLine.Substring(17, 2));
+                // Figure out the millisecond value
+                var ms = 0;
+                var msValue = logLine.Substring(20, 3);
+                if (msValue.Contains(":"))
+                {
+                    ms = int.Parse(msValue.Substring(0, 2));
+                    dateLength = 23;
+                }
+                else
+                {
+                    ms = int.Parse(msValue);
+                }
+
+                entryDate = new DateTime(year, month, day, hour, minute, second, ms);
+            }
+            else if (!DateTime.TryParse(logLine.Substring(0, 8), out entryDate))
             {
                 entry.InvalidReason = "Date couldn't be parsed";
                 return entry;
@@ -291,7 +547,8 @@ namespace LogParserConcept
             var openBrackets = new List<int>();
             var closeBrackets = new List<int>();
 
-            var lineNoTimestamp = logLine.Substring(9).Trim();
+            // We've set "dateLength" based on the log type
+            var lineNoTimestamp = logLine.Substring(dateLength).Trim();
 
             for (var i = lineNoTimestamp.IndexOf('('); i > -1; i = lineNoTimestamp.IndexOf('(', i + 1))
             {
@@ -651,9 +908,9 @@ namespace LogParserConcept
             }
         }
 
-        static void SetTimeElapsed(this LogEntry entry, DateTime encounterStart)
+        static void SetTimeElapsed(this LogEntry entry, DateTime encounterStart, bool isStartOfEncounter = false)
         {
-            entry.SecondsElapsed = (int) (entry.CalculatedTimeStamp - encounterStart).TotalSeconds;
+            entry.SecondsElapsed = isStartOfEncounter ? 0 : entry.SecondsElapsed = (int)(entry.CalculatedTimeStamp - encounterStart).TotalSeconds;
         }
 
         static int GetDowntimeValueForEncounter(this LogEntry entry)
@@ -674,7 +931,9 @@ namespace LogParserConcept
         }
 
         /// <summary>
-        /// This is only used to append a single line at a time. Works, but is incredibly slow. On the upside, uses next to no memory to function well.
+        /// This is only used to append a single line at a time.
+        /// Works, but is incredibly slow if you forget to disable Windows Defender or any other A/V.
+        /// On the upside, uses next to no memory to function well.
         /// </summary>
         /// <param name="sessionPath"></param>
         /// <param name="encounterNumber"></param>
@@ -691,6 +950,89 @@ namespace LogParserConcept
             catch (Exception ex)
             {
                 Console.WriteLine($"Error writing to {filename}: {ex.Message}");
+            }
+        }
+
+        static async Task AppendLine_SingleFileForEncounter(string sessionPath, int encounterNumber, string line)
+        {
+            try
+            {
+                var filePath = Path.Combine(sessionPath, encounterNumber.ToString(), $"encounter{encounterNumber}.txt");
+                await File.AppendAllTextAsync(filePath, line + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing to encounter{encounterNumber}.txt: {ex.Message}");
+            }
+        }
+
+        static async Task AppendLine_SingleFileForEncounter(string sessionPath, int encounterNumber, List<string> lines)
+        {
+            try
+            {
+                var filePath = Path.Combine(sessionPath, encounterNumber.ToString(), $"encounter{encounterNumber}.txt");
+                await File.AppendAllLinesAsync(filePath, lines);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing to encounter{encounterNumber}.txt: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// This was built for testing purposes but isn't currently used.
+        /// As it stands right now, ~4797kb of damage records gives a ~5396kb damage JSON document.
+        /// </summary>
+        /// <param name="sessionPath"></param>
+        /// <param name="encounterNumber"></param>
+        /// <param name="filename"></param>
+        /// <param name="entries"></param>
+        /// <returns></returns>
+        static async Task WriteJson(string sessionPath, int encounterNumber, string filename, List<LogEntry> entries)
+        {
+            try
+            {
+                var filePath = Path.Combine(sessionPath, encounterNumber.ToString(), filename);
+                var json = JsonConvert.SerializeObject(entries);
+                await File.WriteAllTextAsync(filePath, json + Environment.NewLine);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing to {filename}: {ex.Message}");
+            }
+        }
+
+        static async Task WriteSessionInfo(string sessionPath, List<string> lines)
+        {
+            try
+            {
+                var filePath = Path.Combine(sessionPath, "session.txt");
+                await using StreamWriter sw = new StreamWriter(filePath);
+                foreach (var line in lines)
+                {
+                    await sw.WriteLineAsync(line);
+                }
+
+                await sw.FlushAsync();
+                sw.Close();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing to session info: {ex.Message}");
+            }
+        }
+
+        static async Task WriteSessionStats(string sessionPath, SessionStats stats)
+        {
+            try
+            {
+                await File.WriteAllTextAsync(
+                    Path.Combine(sessionPath, "session.txt"),
+                    JsonConvert.SerializeObject(stats));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing to session info: {ex.Message}");
             }
         }
 
@@ -714,6 +1056,20 @@ namespace LogParserConcept
             }
         }
 
+        static async Task WriteEncounterStats(string sessionPath, int encounterNumber, EncounterStats stats)
+        {
+            try
+            {
+                await File.WriteAllTextAsync(
+                    Path.Combine(sessionPath, $"{encounterNumber}.txt"),
+                    JsonConvert.SerializeObject(stats));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error writing to encounter {encounterNumber} stats: {ex.Message}");
+            }
+        }
+
         static bool RemoveEncounterFolder(string sessionPath, int encounterNumber)
         {
             try
@@ -721,7 +1077,7 @@ namespace LogParserConcept
                 var encounterPath = Path.Combine(sessionPath, encounterNumber.ToString());
                 if (Directory.Exists(encounterPath))
                 {
-                    Directory.Delete(encounterPath);
+                    Directory.Delete(encounterPath, true);
                 }
 
                 // Check again to ensure it's gone
